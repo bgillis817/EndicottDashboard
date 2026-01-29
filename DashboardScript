@@ -1,0 +1,590 @@
+library(shiny)
+library(dplyr)
+library(DT)
+library(ggplot2)
+library(scales)
+library(tidyverse)
+library(readr)
+library(plotly)
+
+# Load and prepare data
+Endicott2026 <- read_csv("https://raw.githubusercontent.com/bgillis817/EndicottDashboard/refs/heads/main/ECRapsodo.csv")
+
+# Print column names to debug
+print("Column names in data:")
+print(names(Endicott2026))
+
+# Clean column names - remove special characters and spaces
+names(Endicott2026) <- gsub("\\s+", "_", names(Endicott2026))
+names(Endicott2026) <- gsub("[()]", "", names(Endicott2026))
+
+# Check if Pitcher column exists, if not, look for alternatives
+if(!"Pitcher" %in% names(Endicott2026)) {
+  pitcher_col <- grep("pitcher|name", names(Endicott2026), ignore.case = TRUE, value = TRUE)[1]
+  if(!is.na(pitcher_col)) {
+    Endicott2026 <- Endicott2026 %>% rename(Pitcher = !!pitcher_col)
+  } else {
+    stop("Cannot find Pitcher column in data")
+  }
+}
+
+Endicott2026 <- Endicott2026 %>%
+  rename_with(~case_when(
+    . == "Release_Height" | grepl("release.*height", ., ignore.case = TRUE) ~ "ReleaseHeight",
+    . == "Release_Side" | grepl("release.*side", ., ignore.case = TRUE) ~ "ReleaseSide",
+    . == "Total_Spin" | grepl("total.*spin", ., ignore.case = TRUE) ~ "TotalSpin",
+    . == "VB_spin" | grepl("vb.*spin", ., ignore.case = TRUE) ~ "VB_spin",
+    . == "HB_trajectory" | grepl("hb.*traj", ., ignore.case = TRUE) ~ "HB_trajectory",
+    . == "Strike_Zone_Height" | grepl("strike.*zone.*height", ., ignore.case = TRUE) ~ "StrikeZoneHeight",
+    . == "Strike_Zone_Side" | grepl("strike.*zone.*side", ., ignore.case = TRUE) ~ "StrikeZoneSide",
+    . == "Release_Extension_ft" | grepl("release.*ext", ., ignore.case = TRUE) ~ "ReleaseExtension",
+    . == "Pitch_Type" | grepl("pitch.*type", ., ignore.case = TRUE) ~ "PitchType",
+    TRUE ~ .
+  )) %>%
+  mutate(
+    ReleaseHeight = as.numeric(ReleaseHeight),
+    ReleaseSide = as.numeric(ReleaseSide),
+    Velocity = as.numeric(Velocity),
+    TotalSpin = as.numeric(TotalSpin),
+    VB_spin = as.numeric(VB_spin),
+    HB_trajectory = as.numeric(HB_trajectory),
+    StrikeZoneHeight = as.numeric(StrikeZoneHeight),
+    StrikeZoneSide = as.numeric(StrikeZoneSide),
+    ReleaseExtension = as.numeric(ReleaseExtension),
+    No = as.numeric(No),
+    Date = as.Date(Date, format = "%m/%d/%Y"),
+    arm_angle = ifelse(
+      !is.na(ReleaseHeight) & !is.na(ReleaseSide) & ReleaseSide != 0,
+      atan2(ReleaseHeight, abs(ReleaseSide)) * (180 / pi),
+      NA
+    ),
+    PlateLocSide = StrikeZoneSide / 12,
+    PlateLocHeight = StrikeZoneHeight / 12,
+    PitchType = case_when(
+      PitchType == "Fastball" ~ "4-Seam",
+      PitchType == "TwoSeamFastball" ~ "2-Seam",
+      TRUE ~ PitchType
+    )
+  ) %>%
+  arrange(Pitcher, Date, No) %>%
+  group_by(Pitcher) %>%
+  mutate(OverallPitchCount = row_number()) %>%
+  ungroup()
+
+pitcher_names <- sort(unique(Endicott2026$Pitcher))
+
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      .logo-container {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 1000;
+      }
+      .logo-container img {
+        height: 60px;
+        width: auto;
+      }
+      .title-panel {
+        position: relative;
+        padding-left: 80px;
+      }
+    "))
+  ),
+  
+  div(class = "logo-container",
+      img(src = "https://raw.githubusercontent.com/bgillis817/EndicottDashboard/refs/heads/main/logo.jpg", 
+          alt = "Endicott Logo")
+  ),
+  
+  div(class = "title-panel",
+      titlePanel("Endicott Pitching Dashboard")
+  ),
+  br(),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4(textOutput("pitcherInfo")),
+      br(),
+      selectInput("pitcher", "Select Pitcher", 
+                  choices = pitcher_names,
+                  selected = pitcher_names[1]),
+      uiOutput("pitchRangeUI"),
+      uiOutput("pitchTypeUI")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Metrics/Summary", 
+                 br(), 
+                 dataTableOutput("pitcher_summary_table"),
+                 br(),
+                 plotlyOutput("pitch_movement_plot", height = "450px"),
+                 plotlyOutput("pitch_release_plot", height = "450px")),
+        tabPanel("Heat Maps", 
+                 br(), 
+                 plotOutput("plot1")),
+        tabPanel("Arm Angle", 
+                 br(), 
+                 plotlyOutput("arm_angle_plot", height = "450px"),
+                 br(),
+                 p(style = "text-align: center; color: gray; font-size: 12px;", 
+                   "Perspective from behind the pitcher's head")),
+        tabPanel("Locations", 
+                 br(), 
+                 plotOutput("pitch_location_plot1")),
+        tabPanel("Velocity/Spin", 
+                 br(), 
+                 plotOutput("lineplot1", height = "400px"),
+                 br(),
+                 plotOutput("lineplot2", height = "400px"))
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  output$pitcherInfo <- renderText({
+    req(input$pitcher)
+    if(input$pitcher == "") return("Please select a pitcher")
+    
+    pitcher_data <- Endicott2026 %>% filter(Pitcher == input$pitcher)
+    total_pitches <- max(pitcher_data$OverallPitchCount, na.rm = TRUE)
+    total_sessions <- n_distinct(pitcher_data$Date)
+    paste0("Total: ", total_pitches, " pitches across ", total_sessions, " outings")
+  })
+  
+  output$pitchTypeUI <- renderUI({
+    req(input$pitcher)
+    if(input$pitcher == "") return(NULL)
+    
+    pitcher_data <- Endicott2026 %>% filter(Pitcher == input$pitcher)
+    pitch_types <- sort(unique(pitcher_data$PitchType))
+    
+    selectInput("pitchType", "Select Pitch Type", 
+                choices = c("All", pitch_types))
+  })
+  
+  output$pitchRangeUI <- renderUI({
+    req(input$pitcher)
+    if(input$pitcher == "") return(NULL)
+    
+    pitcher_data <- Endicott2026 %>% filter(Pitcher == input$pitcher)
+    max_pitch <- max(pitcher_data$OverallPitchCount, na.rm = TRUE)
+    
+    pitcher_dates <- sort(unique(pitcher_data$Date))
+    date_choices <- setNames(as.character(pitcher_dates), 
+                             format(pitcher_dates, "%m/%d/%Y"))
+    
+    tagList(
+      checkboxGroupInput("dateFilter", "Select Session(s) to Include:", 
+                         choices = date_choices,
+                         selected = as.character(pitcher_dates)),
+      
+      actionButton("selectAllDates", "Select All", 
+                   style = "margin-right: 5px; margin-bottom: 10px;"),
+      actionButton("selectNoDates", "Clear All", 
+                   style = "margin-bottom: 10px;"),
+      br(),
+      
+      numericInput("pitchRangeMin", "Minimum Pitch Number", 
+                   min = 1, max = max_pitch, value = 1),
+      numericInput("pitchRangeMax", "Maximum Pitch Number", 
+                   min = 1, max = max_pitch, value = max_pitch),
+      
+      uiOutput("sessionInfo")
+    )
+  })
+  
+  observeEvent(input$selectAllDates, {
+    req(input$pitcher)
+    pitcher_data <- Endicott2026 %>% filter(Pitcher == input$pitcher)
+    pitcher_dates <- sort(unique(pitcher_data$Date))
+    updateCheckboxGroupInput(session, "dateFilter", 
+                             selected = as.character(pitcher_dates))
+  })
+  
+  observeEvent(input$selectNoDates, {
+    updateCheckboxGroupInput(session, "dateFilter", selected = character(0))
+  })
+  
+  output$sessionInfo <- renderUI({
+    req(input$pitcher, input$dateFilter)
+    
+    if (length(input$dateFilter) > 0) {
+      selected_dates <- as.Date(input$dateFilter)
+      pitcher_session_data <- Endicott2026 %>% 
+        filter(Pitcher == input$pitcher, Date %in% selected_dates)
+      
+      if (nrow(pitcher_session_data) > 0) {
+        session_summary <- pitcher_session_data %>%
+          group_by(Date) %>%
+          summarise(pitches = n(), .groups = 'drop') %>%
+          mutate(date_label = format(Date, "%m/%d/%Y"))
+        
+        total_selected_pitches <- sum(session_summary$pitches)
+        
+        tagList(
+          hr(),
+          h5(paste0("Selected Sessions: ", nrow(session_summary), 
+                    " (", total_selected_pitches, " total pitches)")),
+          tags$small(HTML(paste0(session_summary$date_label, ": ", 
+                                 session_summary$pitches, " pitches", collapse = "<br>")))
+        )
+      }
+    } else {
+      tagList(hr(), h5("No sessions selected"))
+    }
+  })
+  
+  filtered_data <- reactive({
+    req(input$pitcher, input$pitchRangeMin, input$pitchRangeMax, input$pitchType)
+    
+    if(input$pitcher == "") return(NULL)
+    
+    data <- Endicott2026 %>% filter(Pitcher == input$pitcher)
+    
+    if (!is.null(input$dateFilter) && length(input$dateFilter) > 0) {
+      selected_dates <- as.Date(input$dateFilter)
+      data <- data %>% filter(Date %in% selected_dates)
+    } else {
+      return(NULL)
+    }
+    
+    if (input$pitchType != "All") {
+      data <- data %>% filter(PitchType == input$pitchType)
+    }
+    
+    data %>% filter(OverallPitchCount >= input$pitchRangeMin & 
+                      OverallPitchCount <= input$pitchRangeMax)
+  })
+  
+  output$pitcher_summary_table <- renderDataTable({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(datatable(data.frame(Message = "No data")))
+    
+    table <- data %>%
+      group_by(Pitch = PitchType) %>%
+      summarize(
+        Pitches = n(),
+        AvgVelo = round(mean(Velocity, na.rm = TRUE), 1),
+        MaxVelo = round(max(Velocity, na.rm = TRUE), 1),
+        SpinRate = round(mean(TotalSpin, na.rm = TRUE), 0),
+        IVB = round(mean(VB_spin, na.rm = TRUE), 1),
+        HB = round(mean(HB_trajectory, na.rm = TRUE), 1),
+        RelZ = round(mean(ReleaseHeight, na.rm = TRUE), 1),
+        RelX = round(mean(ReleaseSide, na.rm = TRUE), 1),
+        Extension = round(mean(ReleaseExtension, na.rm = TRUE), 1),
+        ArmAngle = round(mean(arm_angle, na.rm = TRUE), 1),
+        .groups = 'drop'
+      ) %>%
+      mutate(Usage = scales::percent(Pitches / sum(Pitches), accuracy = 0.1)) %>%
+      select(Pitch, Pitches, Usage, AvgVelo, MaxVelo, SpinRate, IVB, HB, RelZ, RelX, Extension, ArmAngle)
+    
+    datatable(table, options = list(dom = 't'))
+  })
+  
+  # Interactive pitch movement plot
+  output$pitch_movement_plot <- renderPlotly({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    # Add hover text to data
+    data <- data %>%
+      mutate(
+        hover_text = paste0(
+          "<b>", PitchType, "</b><br>",
+          "HB: ", round(HB_trajectory, 1), " in<br>",
+          "IVB: ", round(VB_spin, 1), " in<br>",
+          "Velocity: ", round(Velocity, 1), " mph<br>",
+          "Spin: ", round(TotalSpin, 0), " rpm"
+        )
+      )
+    
+    p <- ggplot(data, aes(x = HB_trajectory, y = VB_spin, color = PitchType, text = hover_text)) +
+      geom_hline(yintercept = 0, linewidth = 0.8, color = "gray60") +
+      geom_vline(xintercept = 0, linewidth = 0.8, color = "gray60") +
+      geom_point(size = 3, alpha = 0.7) +
+      labs(x = "Horizontal Movement (HB)", 
+           y = "Vertical Movement (IVB)", 
+           color = "Pitch Type", 
+           title = paste(input$pitcher, "- Pitch Movement")) +
+      xlim(-30, 30) + ylim(-30, 30) +
+      theme_bw() + 
+      theme(
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank()
+      )
+    
+    ggplotly(p, tooltip = "text") %>%
+      layout(
+        hoverlabel = list(
+          bgcolor = "white",
+          font = list(size = 12, color = "black"),
+          bordercolor = "black"
+        )
+      )
+  })
+  
+  # Interactive pitch release plot
+  output$pitch_release_plot <- renderPlotly({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    # Add hover text to data
+    data <- data %>%
+      mutate(
+        hover_text = paste0(
+          "<b>", PitchType, "</b><br>",
+          "Rel Side: ", round(ReleaseSide, 2), " ft<br>",
+          "Rel Height: ", round(ReleaseHeight, 2), " ft<br>",
+          "Extension: ", round(ReleaseExtension, 1), " ft<br>",
+          "Arm Angle: ", round(arm_angle, 1), "°"
+        )
+      )
+    
+    p <- ggplot(data, aes(x = ReleaseSide, y = ReleaseHeight, color = PitchType, text = hover_text)) +
+      geom_hline(yintercept = 5, linewidth = 0.5, color = "gray60") +
+      geom_vline(xintercept = 0, linewidth = 0.5, color = "gray60") +
+      geom_point(size = 3, alpha = 0.7) +
+      labs(x = "Horizontal Release Point", 
+           y = "Vertical Release Point", 
+           color = "Pitch Type", 
+           title = paste(input$pitcher, "- Release Points")) +
+      xlim(-4, 4) + ylim(2, 7) +
+      theme_bw() + 
+      theme(
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank()
+      )
+    
+    ggplotly(p, tooltip = "text") %>%
+      layout(
+        hoverlabel = list(
+          bgcolor = "white",
+          font = list(size = 12, color = "black"),
+          bordercolor = "black"
+        )
+      )
+  })
+  
+  # Interactive arm angle plot
+  output$arm_angle_plot <- renderPlotly({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    avg_angles <- data %>%
+      filter(!is.na(arm_angle)) %>%
+      group_by(PitchType) %>%
+      summarise(avg_angle = mean(arm_angle, na.rm = TRUE),
+                avg_rel_side = mean(ReleaseSide, na.rm = TRUE),
+                avg_rel_height = mean(ReleaseHeight, na.rm = TRUE),
+                .groups = 'drop')
+    
+    if(nrow(avg_angles) == 0) return(NULL)
+    
+    # Create circle for head
+    theta <- seq(0, 2*pi, length.out = 100)
+    head_circle <- data.frame(x = 0.25 * cos(theta), y = 1.7 + 0.25 * sin(theta))
+    
+    # Create base plot with ggplot
+    p <- ggplot() +
+      geom_rect(aes(xmin = -0.3, xmax = 0.3, ymin = 0, ymax = 1), 
+                fill = "gray80", alpha = 0.3) +
+      geom_polygon(data = head_circle, aes(x = x, y = y), 
+                   fill = "gray80", alpha = 0.3) +
+      geom_segment(data = avg_angles,
+                   aes(x = 0, y = 1, xend = avg_rel_side/2, 
+                       yend = 1 + avg_rel_height/3, color = PitchType,
+                       text = paste0("<b>", PitchType, "</b><br>Arm Angle: ", round(avg_angle, 1), "°")),
+                   linewidth = 2, arrow = arrow(length = unit(0.3, "cm"))) +
+      coord_fixed(ratio = 1) +
+      labs(title = paste(input$pitcher, "- Arm Angle by Pitch Type")) +
+      theme_minimal() +
+      theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+            axis.text = element_blank(), axis.title = element_blank(),
+            panel.grid = element_blank(), legend.position = "bottom") +
+      xlim(-2, 2) + ylim(-0.5, 3)
+    
+    # Convert to plotly for interactivity
+    ggplotly(p, tooltip = "text") %>%
+      layout(
+        hoverlabel = list(
+          bgcolor = "white",
+          font = list(size = 14, color = "black"),
+          bordercolor = "black"
+        )
+      )
+  })
+  
+  output$pitch_location_plot1 <- renderPlot({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    ggplot(data, aes(x = PlateLocSide, y = PlateLocHeight, color = PitchType)) +
+      geom_point(size = 3, alpha = 0.7) +
+      annotate("rect", xmin = -1, xmax = 1, ymin = 1.6, ymax = 3.4,
+               fill = NA, color = "black", linewidth = 1) +
+      geom_vline(xintercept = 0, linewidth = 0.5, color = "gray60", linetype = "dashed") +
+      geom_hline(yintercept = 2.5, linewidth = 0.5, color = "gray60", linetype = "dashed") +
+      labs(x = "Horizontal Location", 
+           y = "Vertical Location", 
+           title = paste(input$pitcher, "- Pitch Locations"), 
+           subtitle = "From the Pitcher's Perspective") +
+      ylim(1, 4) + xlim(-1.8, 1.8) + 
+      theme_bw() +
+      theme(
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 11, hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  output$lineplot1 <- renderPlot({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    plot_data <- data %>%
+      arrange(Date, No) %>%
+      group_by(PitchType) %>%
+      mutate(PitchIndex = row_number() - 1) %>%
+      ungroup()
+    
+    summary_data <- plot_data %>%
+      group_by(PitchType) %>%
+      summarise(
+        avg_velo = mean(Velocity, na.rm = TRUE),
+        min_velo = min(Velocity, na.rm = TRUE),
+        max_velo = max(Velocity, na.rm = TRUE),
+        max_index = max(PitchIndex),
+        last_velo = last(Velocity),
+        .groups = 'drop'
+      ) %>%
+      mutate(
+        label_text = paste0(round(avg_velo, 1), " mph\n(", round(min_velo, 1), "-", round(max_velo, 1), ")")
+      )
+    
+    ggplot(plot_data, aes(x = PitchIndex, y = Velocity, color = PitchType)) +
+      geom_line(linewidth = 1.2, alpha = 0.8) +
+      geom_point(size = 1.5, alpha = 0.4) +
+      geom_text(data = summary_data,
+                aes(x = max_index, y = last_velo, 
+                    label = label_text, color = PitchType),
+                hjust = -0.1, vjust = 0.5, size = 3, 
+                fontface = "plain", lineheight = 0.9) +
+      scale_x_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+      labs(x = "Pitch Count", 
+           y = "Pitch Velocity (MPH)", 
+           title = "Pitch Velocity Over Time") +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14, face = "plain"),
+        axis.title = element_text(size = 11),
+        axis.text = element_text(size = 10),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(color = "gray92", linewidth = 0.3),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA)
+      )
+  }, width = 800, height = 400)
+  
+  output$lineplot2 <- renderPlot({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    plot_data <- data %>%
+      arrange(Date, No) %>%
+      group_by(PitchType) %>%
+      mutate(PitchIndex = row_number() - 1) %>%
+      ungroup()
+    
+    summary_data <- plot_data %>%
+      group_by(PitchType) %>%
+      summarise(
+        avg_spin = mean(TotalSpin, na.rm = TRUE),
+        min_spin = min(TotalSpin, na.rm = TRUE),
+        max_spin = max(TotalSpin, na.rm = TRUE),
+        max_index = max(PitchIndex),
+        last_spin = last(TotalSpin),
+        .groups = 'drop'
+      ) %>%
+      mutate(
+        label_text = paste0(round(avg_spin, 0), " rpm\n(", round(min_spin, 0), "-", round(max_spin, 0), ")")
+      )
+    
+    ggplot(plot_data, aes(x = PitchIndex, y = TotalSpin, color = PitchType)) +
+      geom_line(linewidth = 1.2, alpha = 0.8) +
+      geom_point(size = 1.5, alpha = 0.4) +
+      geom_text(data = summary_data,
+                aes(x = max_index, y = last_spin, 
+                    label = label_text, color = PitchType),
+                hjust = -0.1, vjust = 0.5, size = 3, 
+                fontface = "plain", lineheight = 0.9) +
+      scale_x_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+      labs(x = "Pitch Count", 
+           y = "Spin Rate (RPM)", 
+           title = "Spin Rate Over Time") +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14, face = "plain"),
+        axis.title = element_text(size = 11),
+        axis.text = element_text(size = 10),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(color = "gray92", linewidth = 0.3),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA)
+      )
+  }, width = 800, height = 400)
+  
+  output$plot1 <- renderPlot({
+    data <- filtered_data()
+    req(data)
+    if(nrow(data) == 0) return(NULL)
+    
+    ggplot(data, aes(x = PlateLocSide, y = PlateLocHeight)) +
+      stat_density_2d(aes(fill = ..density..), geom = 'raster', contour = FALSE) +
+      scale_fill_gradientn(colours = c("blue", "white", "red")) +
+      annotate("rect", xmin = -1, xmax = 1, ymin = 1.6, ymax = 3.4,
+               fill = NA, color = "black", alpha = .1) +
+      geom_vline(xintercept = 0, linewidth = 0.3, color = "black", linetype = "dashed", alpha = 0.5) +
+      geom_hline(yintercept = 2.5, linewidth = 0.3, color = "black", linetype = "dashed", alpha = 0.5) +
+      ylim(1, 4) + xlim(-1.8, 1.8) +
+      theme_bw() +
+      theme_classic() +
+      xlab("Horizontal Pitch Location") +
+      ylab("Vertical Pitch Location") +
+      ggtitle(paste(input$pitcher, "- Pitch Location Heat Map"), 
+              subtitle = "Pitcher's Perspective") +
+      facet_wrap(~PitchType, ncol = 3) +
+      guides(fill = FALSE)
+  }, width = 700, height = 400)
+}
+
+shinyApp(ui = ui, server = server)
