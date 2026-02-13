@@ -6,6 +6,8 @@ library(scales)
 library(tidyverse)
 library(readr)
 library(plotly)
+library(MASS)  # For kde2d in pitch sequencing heatmaps and movement consistency blobs
+library(purrr) # For map_dfr in KDE contour construction
 
 # Load and prepare data
 Endicott2026 <- read_csv("https://raw.githubusercontent.com/bgillis817/EndicottDashboard/refs/heads/main/ECRapsodo.csv")
@@ -39,6 +41,7 @@ Endicott2026 <- Endicott2026 %>%
     . == "Strike_Zone_Side" | grepl("strike.*zone.*side", ., ignore.case = TRUE) ~ "StrikeZoneSide",
     . == "Release_Extension_ft" | grepl("release.*ext", ., ignore.case = TRUE) ~ "ReleaseExtension",
     . == "Pitch_Type" | grepl("pitch.*type", ., ignore.case = TRUE) ~ "PitchType",
+    . == "Is_Strike" | . == "Is_strike" ~ "IsStrike",
     TRUE ~ .
   )) %>%
   mutate(
@@ -71,6 +74,51 @@ Endicott2026 <- Endicott2026 %>%
   mutate(OverallPitchCount = row_number()) %>%
   ungroup()
 
+# ============================================================================
+# PITCH SEQUENCING DATA PREPARATION
+# ============================================================================
+
+# Debug: Print column names to check for IsStrike
+print("Columns available for pitch sequencing:")
+print(names(Endicott2026))
+print(paste("IsStrike column exists:", "IsStrike" %in% names(Endicott2026)))
+
+# Create pitch sequences with lag
+pitch_sequences <- Endicott2026 %>%
+  arrange(Pitcher, Date, No) %>%
+  group_by(Pitcher, Date) %>%
+  mutate(
+    prev_pitch_type = lag(PitchType),
+    prev_is_strike = lag(IsStrike),
+    prev_plate_loc_side = lag(PlateLocSide),
+    prev_plate_loc_height = lag(PlateLocHeight)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(prev_pitch_type))
+
+# Debug: Check if pitch_sequences has data
+print(paste("Pitch sequences created:", nrow(pitch_sequences), "rows"))
+
+# Calculate strike rates by pitch pair
+pitch_pair_matrix <- pitch_sequences %>%
+  group_by(Pitcher, prev_pitch_type, PitchType) %>%
+  summarise(
+    n_pairs = n(),
+    first_strike_rate = mean(prev_is_strike == "Y", na.rm = TRUE),
+    second_strike_rate = mean(IsStrike == "Y", na.rm = TRUE),
+    both_strike_rate = mean(prev_is_strike == "Y" & IsStrike == "Y", na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    strike_rate_diff = second_strike_rate - first_strike_rate,
+    avg_strike_rate = (first_strike_rate + second_strike_rate) / 2
+  )
+
+# Debug: Check if pitch_pair_matrix has data
+print(paste("Pitch pair matrix created:", nrow(pitch_pair_matrix), "rows"))
+
+# ============================================================================
+
 pitcher_names <- sort(unique(Endicott2026$Pitcher))
 
 ui <- fluidPage(
@@ -89,6 +137,13 @@ ui <- fluidPage(
       .title-panel {
         position: relative;
         padding-left: 80px;
+      }
+      .matrix-cell {
+        cursor: pointer;
+        transition: opacity 0.2s;
+      }
+      .matrix-cell:hover {
+        opacity: 0.8;
       }
     "))
   ),
@@ -120,17 +175,60 @@ ui <- fluidPage(
                  br(), 
                  dataTableOutput("pitcher_summary_table"),
                  br(),
-                 plotlyOutput("pitch_movement_plot", height = "450px"),
+                 plotlyOutput("pitch_movement_plot", height = "500px"),
                  plotlyOutput("pitch_release_plot", height = "450px")),
         tabPanel("Heat Maps", 
                  br(), 
                  plotOutput("plot1")),
         tabPanel("Arm Angle", 
                  br(), 
-                 plotlyOutput("arm_angle_plot", height = "450px"),
+                 plotlyOutput("arm_angle_plot", height = "500px"),
                  br(),
                  p(style = "text-align: center; color: gray; font-size: 12px;", 
                    "Perspective from behind the pitcher's head")),
+        
+        # ===== PITCH SEQUENCING TAB =====
+        tabPanel("Pitch Sequences",
+                 br(),
+                 fluidRow(
+                   column(12,
+                          h3(textOutput("sequence_title"), style = "text-align: center; font-weight: bold;"),
+                          h5("Strike rate effectiveness by back-to-back pitch sequence", 
+                             style = "text-align: center; color: gray;")
+                   )
+                 ),
+                 br(),
+                 fluidRow(
+                   column(7,
+                          plotOutput("sequence_matrix", height = "550px", click = "matrix_click")
+                   ),
+                   column(5,
+                          h5("Pitch Location Heatmaps", 
+                             style = "text-align: center; font-weight: bold; margin-bottom: 20px;"),
+                          fluidRow(
+                            column(6,
+                                   h6(textOutput("hover_first_pitch_label"), 
+                                      style = "text-align: center; font-weight: bold; color: #333;"),
+                                   plotOutput("hover_first_pitch_location", height = "280px")
+                            ),
+                            column(6,
+                                   h6(textOutput("hover_second_pitch_label"), 
+                                      style = "text-align: center; font-weight: bold; color: #333;"),
+                                   plotOutput("hover_second_pitch_location", height = "280px")
+                            )
+                          ),
+                          br(),
+                          wellPanel(
+                            style = "background-color: #f8f9fa; padding: 15px;",
+                            h6("Click on any cell to see pitch locations", 
+                               style = "text-align: center; margin-bottom: 10px; color: #666;"),
+                            htmlOutput("hover_stats")
+                          )
+                   )
+                 )
+        ),
+        # ===== END PITCH SEQUENCING TAB =====
+        
         tabPanel("Locations", 
                  br(), 
                  plotOutput("pitch_location_plot1")),
@@ -261,6 +359,7 @@ server <- function(input, output, session) {
                       OverallPitchCount <= input$pitchRangeMax)
   })
   
+  # USING WORKING VERSION FROM DASHBOARDSCRIPT(2)
   output$pitcher_summary_table <- renderDataTable({
     data <- filtered_data()
     req(data)
@@ -282,18 +381,17 @@ server <- function(input, output, session) {
         .groups = 'drop'
       ) %>%
       mutate(Usage = scales::percent(Pitches / sum(Pitches), accuracy = 0.1)) %>%
-      select(Pitch, Pitches, Usage, AvgVelo, MaxVelo, SpinRate, IVB, HB, RelZ, RelX, Extension, ArmAngle)
+      dplyr::select(Pitch, Pitches, Usage, AvgVelo, MaxVelo, SpinRate, IVB, HB, RelZ, RelX, Extension, ArmAngle)
     
     datatable(table, options = list(dom = 't'))
   })
   
-  # Interactive pitch movement plot
+  # ── Pitch movement plot with smooth KDE gradient blobs ───────────────────
   output$pitch_movement_plot <- renderPlotly({
     data <- filtered_data()
     req(data)
     if(nrow(data) == 0) return(NULL)
     
-    # Add hover text to data
     data <- data %>%
       mutate(
         hover_text = paste0(
@@ -305,21 +403,106 @@ server <- function(input, output, session) {
         )
       )
     
-    p <- ggplot(data, aes(x = HB_trajectory, y = VB_spin, color = PitchType, text = hover_text)) +
+    # Colour palette keyed to pitch types in this filtered set
+    pitch_types <- unique(data$PitchType)
+    pal         <- scales::hue_pal()(length(pitch_types))
+    names(pal)  <- pitch_types
+    
+    # 8 contour shells: outermost faint -> innermost dense
+    n_shells     <- 8
+    prob_levels  <- seq(0.95, 0.10, length.out = n_shells)
+    alpha_levels <- seq(0.04, 0.22, length.out = n_shells)
+    
+    # Build KDE contour polygons per pitch type
+    kde_polys <- purrr::map_dfr(pitch_types, function(pt) {
+      sub <- data %>%
+        filter(PitchType == pt,
+               !is.na(HB_trajectory), !is.na(VB_spin))
+      
+      if(nrow(sub) < 5) return(NULL)
+      
+      kde <- MASS::kde2d(
+        sub$HB_trajectory, sub$VB_spin,
+        n    = 100,
+        lims = c(-30, 30, -30, 30)
+      )
+      
+      kde_df  <- expand.grid(x = kde$x, y = kde$y) %>%
+        mutate(z = as.vector(kde$z))
+      total_z <- sum(kde_df$z)
+      
+      purrr::map_dfr(seq_along(prob_levels), function(i) {
+        lvl        <- prob_levels[i]
+        sorted_z   <- sort(kde_df$z, decreasing = TRUE)
+        cum_z      <- cumsum(sorted_z) / total_z
+        thresh_idx <- which(cum_z >= (1 - lvl))[1]
+        thresh     <- if(!is.na(thresh_idx)) sorted_z[thresh_idx] else 0
+        
+        cl <- grDevices::contourLines(
+          x = kde$x, y = kde$y, z = kde$z, levels = thresh
+        )
+        if(length(cl) == 0) return(NULL)
+        
+        purrr::map_dfr(seq_along(cl), function(j) {
+          data.frame(
+            x         = cl[[j]]$x,
+            y         = cl[[j]]$y,
+            PitchType = pt,
+            shell     = i,
+            alpha_val = alpha_levels[i],
+            group_id  = paste(pt, i, j, sep = "_")
+          )
+        })
+      })
+    })
+    
+    # Base axes
+    p <- ggplot() +
       geom_hline(yintercept = 0, linewidth = 0.8, color = "gray60") +
-      geom_vline(xintercept = 0, linewidth = 0.8, color = "gray60") +
-      geom_point(size = 3, alpha = 0.7) +
-      labs(x = "Horizontal Movement (HB)", 
-           y = "Vertical Movement (IVB)", 
-           color = "Pitch Type", 
-           title = paste(input$pitcher, "- Pitch Movement")) +
+      geom_vline(xintercept = 0, linewidth = 0.8, color = "gray60")
+    
+    # Layer KDE shells faint -> dense — NO fill aes mapping so no fill legend
+    if(!is.null(kde_polys) && nrow(kde_polys) > 0) {
+      for(i in seq_len(n_shells)) {
+        shell_data <- kde_polys %>% filter(shell == i)
+        if(nrow(shell_data) == 0) next
+        alph <- unique(shell_data$alpha_val)
+        # Loop per pitch type so we can set fill colour manually without aes mapping
+        for(pt in unique(shell_data$PitchType)) {
+          pt_data <- shell_data %>% filter(PitchType == pt)
+          p <- p +
+            geom_polygon(
+              data  = pt_data,
+              aes(x = x, y = y, group = group_id),
+              fill  = pal[pt],
+              alpha = alph,
+              color = NA
+            )
+        }
+      }
+    }
+    
+    p <- p +
+      geom_point(
+        data = data,
+        aes(x = HB_trajectory, y = VB_spin, color = PitchType, text = hover_text),
+        size = 2.5, alpha = 0.65
+      ) +
+      scale_color_manual(values = pal, name = "Pitch Type") +
+      labs(
+        x        = "Horizontal Movement (HB)",
+        y        = "Vertical Movement (IVB)",
+        title    = paste(input$pitcher, "- Movement Consistency (IVB vs HB)"),
+        subtitle = "Shaded areas show how consistently the pitcher replicates pitch shape"
+      ) +
       xlim(-30, 30) + ylim(-30, 30) +
-      theme_bw() + 
+      theme_bw() +
       theme(
-        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
-        legend.position = "bottom",
-        legend.title = element_text(size = 11, face = "bold"),
-        legend.text = element_text(size = 10),
+        plot.title       = element_text(size = 16, face = "bold", hjust = 0.5),
+        plot.subtitle    = element_text(size = 10, color = "gray40", hjust = 0.5),
+        legend.position  = "right",
+        legend.title     = element_text(size = 11, face = "bold"),
+        legend.text      = element_text(size = 10),
         panel.grid.major = element_line(color = "gray90"),
         panel.grid.minor = element_blank()
       )
@@ -327,8 +510,8 @@ server <- function(input, output, session) {
     ggplotly(p, tooltip = "text") %>%
       layout(
         hoverlabel = list(
-          bgcolor = "white",
-          font = list(size = 12, color = "black"),
+          bgcolor     = "white",
+          font        = list(size = 12, color = "black"),
           bordercolor = "black"
         )
       )
@@ -340,33 +523,33 @@ server <- function(input, output, session) {
     req(data)
     if(nrow(data) == 0) return(NULL)
     
-    # Add hover text to data
     data <- data %>%
       mutate(
         hover_text = paste0(
           "<b>", PitchType, "</b><br>",
-          "Rel Side: ", round(ReleaseSide, 2), " ft<br>",
-          "Rel Height: ", round(ReleaseHeight, 2), " ft<br>",
-          "Extension: ", round(ReleaseExtension, 1), " ft<br>",
-          "Arm Angle: ", round(arm_angle, 1), "°"
+          "Rel Side: ",   round(ReleaseSide,     2), " ft<br>",
+          "Rel Height: ", round(ReleaseHeight,    2), " ft<br>",
+          "Extension: ",  round(ReleaseExtension, 1), " ft<br>",
+          "Arm Angle: ",  round(arm_angle,         1), "\u00b0"
         )
       )
     
-    p <- ggplot(data, aes(x = ReleaseSide, y = ReleaseHeight, color = PitchType, text = hover_text)) +
+    p <- ggplot(data, aes(x = ReleaseSide, y = ReleaseHeight,
+                          color = PitchType, text = hover_text)) +
       geom_hline(yintercept = 5, linewidth = 0.5, color = "gray60") +
       geom_vline(xintercept = 0, linewidth = 0.5, color = "gray60") +
       geom_point(size = 3, alpha = 0.7) +
-      labs(x = "Horizontal Release Point", 
-           y = "Vertical Release Point", 
-           color = "Pitch Type", 
+      labs(x     = "Horizontal Release Point",
+           y     = "Vertical Release Point",
+           color = "Pitch Type",
            title = paste(input$pitcher, "- Release Points")) +
       xlim(-4, 4) + ylim(2, 7) +
-      theme_bw() + 
+      theme_bw() +
       theme(
-        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
-        legend.position = "bottom",
-        legend.title = element_text(size = 11, face = "bold"),
-        legend.text = element_text(size = 10),
+        plot.title       = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.position  = "bottom",
+        legend.title     = element_text(size = 11, face = "bold"),
+        legend.text      = element_text(size = 10),
         panel.grid.major = element_line(color = "gray90"),
         panel.grid.minor = element_blank()
       )
@@ -374,62 +557,390 @@ server <- function(input, output, session) {
     ggplotly(p, tooltip = "text") %>%
       layout(
         hoverlabel = list(
-          bgcolor = "white",
-          font = list(size = 12, color = "black"),
+          bgcolor     = "white",
+          font        = list(size = 12, color = "black"),
           bordercolor = "black"
         )
       )
   })
   
-  # Interactive arm angle plot
+  # ── Arm angle plot with SD fan shading + SD in hover ─────────────────────
   output$arm_angle_plot <- renderPlotly({
     data <- filtered_data()
     req(data)
     if(nrow(data) == 0) return(NULL)
     
-    avg_angles <- data %>%
-      filter(!is.na(arm_angle)) %>%
+    arm_data <- data %>% filter(!is.na(arm_angle))
+    if(nrow(arm_data) == 0) return(NULL)
+    
+    avg_angles <- arm_data %>%
       group_by(PitchType) %>%
-      summarise(avg_angle = mean(arm_angle, na.rm = TRUE),
-                avg_rel_side = mean(ReleaseSide, na.rm = TRUE),
-                avg_rel_height = mean(ReleaseHeight, na.rm = TRUE),
-                .groups = 'drop')
+      summarise(
+        avg_angle      = mean(arm_angle,      na.rm = TRUE),
+        sd_angle       = sd(arm_angle,        na.rm = TRUE),
+        avg_rel_side   = mean(ReleaseSide,    na.rm = TRUE),
+        avg_rel_height = mean(ReleaseHeight,  na.rm = TRUE),
+        n              = n(),
+        .groups        = 'drop'
+      ) %>%
+      mutate(
+        # Fallback: single-pitch types get a minimal fan so no crash
+        sd_angle     = ifelse(is.na(sd_angle) | sd_angle == 0, 0.5, sd_angle),
+        xend         = avg_rel_side / 2,
+        yend         = 1 + avg_rel_height / 3,
+        base_angle   = atan2(yend - 1, xend - 0),
+        half_fan_rad = sd_angle * pi / 180,
+        hover_label  = paste0(
+          "<b>", PitchType, "</b><br>",
+          "Avg Arm Angle: ", round(avg_angle, 1), "\u00b0<br>",
+          "SD: \u00b1",      round(sd_angle,  1), "\u00b0<br>",
+          "Pitches: ",       n
+        )
+      )
     
-    if(nrow(avg_angles) == 0) return(NULL)
-    
-    # Create circle for head
-    theta <- seq(0, 2*pi, length.out = 100)
+    # Head circle
+    theta       <- seq(0, 2 * pi, length.out = 100)
     head_circle <- data.frame(x = 0.25 * cos(theta), y = 1.7 + 0.25 * sin(theta))
     
-    # Create base plot with ggplot
+    # Colour palette matching ggplot default
+    pitch_types <- unique(avg_angles$PitchType)
+    pal         <- scales::hue_pal()(length(pitch_types))
+    names(pal)  <- pitch_types
+    
+    # Base plot: body + head silhouette
     p <- ggplot() +
-      geom_rect(aes(xmin = -0.3, xmax = 0.3, ymin = 0, ymax = 1), 
+      geom_rect(aes(xmin = -0.3, xmax = 0.3, ymin = 0, ymax = 1),
                 fill = "gray80", alpha = 0.3) +
-      geom_polygon(data = head_circle, aes(x = x, y = y), 
-                   fill = "gray80", alpha = 0.3) +
-      geom_segment(data = avg_angles,
-                   aes(x = 0, y = 1, xend = avg_rel_side/2, 
-                       yend = 1 + avg_rel_height/3, color = PitchType,
-                       text = paste0("<b>", PitchType, "</b><br>Arm Angle: ", round(avg_angle, 1), "°")),
-                   linewidth = 2, arrow = arrow(length = unit(0.3, "cm"))) +
+      geom_polygon(data = head_circle, aes(x = x, y = y),
+                   fill = "gray80", alpha = 0.3)
+    
+    # Add SD fan per pitch type
+    n_pts <- 40
+    for(pt in pitch_types) {
+      row    <- avg_angles %>% filter(PitchType == pt)
+      col    <- pal[pt]
+      base_a <- row$base_angle
+      half_r <- row$half_fan_rad
+      
+      # Outer fan: full +/-1 SD, faint
+      angles_outer <- seq(base_a - half_r, base_a + half_r, length.out = n_pts)
+      fan_outer    <- data.frame(
+        x = c(0, 0.95 * cos(angles_outer), 0),
+        y = c(1, 1 + 0.95 * sin(angles_outer), 1)
+      )
+      
+      # Inner fan: +/-0.5 SD, darker (tight consistency zone)
+      half_r_inner <- half_r * 0.5
+      angles_inner <- seq(base_a - half_r_inner, base_a + half_r_inner, length.out = n_pts)
+      fan_inner    <- data.frame(
+        x = c(0, 0.95 * cos(angles_inner), 0),
+        y = c(1, 1 + 0.95 * sin(angles_inner), 1)
+      )
+      
+      p <- p +
+        geom_polygon(data = fan_outer, aes(x = x, y = y),
+                     fill = col, alpha = 0.15, color = NA) +
+        geom_polygon(data = fan_inner, aes(x = x, y = y),
+                     fill = col, alpha = 0.30, color = NA)
+    }
+    
+    # Arrows on top — hover carries avg angle + SD + n
+    p <- p +
+      geom_segment(
+        data = avg_angles,
+        aes(x = 0, y = 1, xend = xend, yend = yend,
+            color = PitchType, text = hover_label),
+        linewidth = 2,
+        arrow = arrow(length = unit(0.3, "cm"))
+      ) +
       coord_fixed(ratio = 1) +
-      labs(title = paste(input$pitcher, "- Arm Angle by Pitch Type")) +
+      labs(
+        title    = paste(input$pitcher, "- Arm Angle by Pitch Type"),
+        subtitle = "Fan width reflects arm angle SD — narrower = more consistent slot"
+      ) +
       theme_minimal() +
-      theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
-            axis.text = element_blank(), axis.title = element_blank(),
-            panel.grid = element_blank(), legend.position = "bottom") +
+      theme(
+        plot.title      = element_text(size = 16, face = "bold",    hjust = 0.5),
+        plot.subtitle   = element_text(size = 10, color = "gray40", hjust = 0.5),
+        axis.text       = element_blank(),
+        axis.title      = element_blank(),
+        panel.grid      = element_blank(),
+        legend.position = "bottom"
+      ) +
       xlim(-2, 2) + ylim(-0.5, 3)
     
-    # Convert to plotly for interactivity
     ggplotly(p, tooltip = "text") %>%
       layout(
         hoverlabel = list(
-          bgcolor = "white",
-          font = list(size = 14, color = "black"),
+          bgcolor     = "white",
+          font        = list(size = 14, color = "black"),
           bordercolor = "black"
         )
       )
   })
+  
+  # ============================================================================
+  # PITCH SEQUENCING TAB OUTPUTS
+  # ============================================================================
+  
+  output$sequence_title <- renderText({
+    req(input$pitcher)
+    paste(input$pitcher, "- Pitch Sequencing Matrix")
+  })
+  
+  # Reactive value to store clicked cell
+  clicked_cell <- reactiveValues(first_pitch = NULL, second_pitch = NULL)
+  
+  output$sequence_matrix <- renderPlot({
+    req(input$pitcher)
+    
+    pitcher_matrix <- pitch_pair_matrix %>%
+      filter(Pitcher == input$pitcher)
+    
+    if(nrow(pitcher_matrix) == 0) {
+      return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, 
+                        label = "No pitch sequence data available\n(IsStrike column may be missing)", 
+                        size = 6, color = "gray50") +
+               theme_void())
+    }
+    
+    # Get all unique pitch types for this pitcher
+    all_pitch_types <- sort(unique(c(pitcher_matrix$prev_pitch_type, 
+                                     pitcher_matrix$PitchType)))
+    
+    # Create complete matrix with all combinations
+    complete_matrix <- expand.grid(
+      prev_pitch_type = all_pitch_types,
+      PitchType = all_pitch_types,
+      stringsAsFactors = FALSE
+    ) %>%
+      left_join(pitcher_matrix, by = c("prev_pitch_type", "PitchType")) %>%
+      mutate(
+        Pitcher = input$pitcher,
+        n_pairs = ifelse(is.na(n_pairs), 0, n_pairs),
+        avg_strike_rate = ifelse(is.na(avg_strike_rate), NA, avg_strike_rate),
+        cell_label = ifelse(n_pairs > 0, 
+                            paste0(round(avg_strike_rate * 100, 0), "%\n(n=", n_pairs, ")"),
+                            "")
+      )
+    
+    # Create the heatmap
+    ggplot(complete_matrix, aes(x = prev_pitch_type, y = PitchType, fill = avg_strike_rate)) +
+      geom_tile(color = "white", linewidth = 1.5) +
+      geom_text(aes(label = cell_label), size = 4, fontface = "bold", 
+                color = "black", lineheight = 0.85) +
+      scale_fill_gradient2(
+        low = "#d73027", 
+        mid = "#ffffbf", 
+        high = "#1a9850",
+        midpoint = 0.5,
+        na.value = "gray90",
+        limits = c(0, 1),
+        labels = scales::percent_format(),
+        name = "Strike Rate"
+      ) +
+      labs(
+        x = "First Pitch",
+        y = "Second Pitch",
+        title = ""
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12, face = "bold"),
+        axis.text.y = element_text(size = 12, face = "bold"),
+        axis.title = element_text(size = 13, face = "bold"),
+        panel.grid = element_blank(),
+        legend.position = "right",
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.text = element_text(size = 10),
+        plot.margin = margin(10, 10, 10, 10)
+      ) +
+      coord_fixed()
+  })
+  
+  # Handle click event on the matrix
+  observeEvent(input$matrix_click, {
+    req(input$pitcher, input$matrix_click)
+    
+    pitcher_matrix <- pitch_pair_matrix %>%
+      filter(Pitcher == input$pitcher)
+    
+    all_pitch_types <- sort(unique(c(pitcher_matrix$prev_pitch_type, 
+                                     pitcher_matrix$PitchType)))
+    
+    # Calculate which cell was clicked
+    x_index <- round(input$matrix_click$x)
+    y_index <- round(input$matrix_click$y)
+    
+    if(x_index >= 1 && x_index <= length(all_pitch_types) &&
+       y_index >= 1 && y_index <= length(all_pitch_types)) {
+      
+      clicked_cell$first_pitch <- all_pitch_types[x_index]
+      clicked_cell$second_pitch <- all_pitch_types[y_index]
+    }
+  })
+  
+  output$hover_first_pitch_label <- renderText({
+    if(!is.null(clicked_cell$first_pitch)) {
+      paste("First Pitch:", clicked_cell$first_pitch)
+    } else {
+      "First Pitch: (click a cell)"
+    }
+  })
+  
+  output$hover_second_pitch_label <- renderText({
+    if(!is.null(clicked_cell$second_pitch)) {
+      paste("Second Pitch:", clicked_cell$second_pitch)
+    } else {
+      "Second Pitch: (click a cell)"
+    }
+  })
+  
+  output$hover_stats <- renderUI({
+    req(clicked_cell$first_pitch, clicked_cell$second_pitch)
+    
+    pair_data <- pitch_pair_matrix %>%
+      filter(
+        Pitcher == input$pitcher,
+        prev_pitch_type == clicked_cell$first_pitch,
+        PitchType == clicked_cell$second_pitch
+      )
+    
+    if(nrow(pair_data) == 0) {
+      return(HTML("<p style='text-align: center; color: #999;'>No data for this sequence</p>"))
+    }
+    
+    HTML(paste0(
+      "<div style='text-align: left;'>",
+      "<p style='margin: 5px 0;'><b>Sequence Count:</b> ", pair_data$n_pairs, " pitches</p>",
+      "<p style='margin: 5px 0;'><b>First Pitch Strike Rate:</b> ", 
+      round(pair_data$first_strike_rate * 100, 1), "%</p>",
+      "<p style='margin: 5px 0;'><b>Second Pitch Strike Rate:</b> ", 
+      round(pair_data$second_strike_rate * 100, 1), "%</p>",
+      "<p style='margin: 5px 0;'><b>Both Strikes:</b> ", 
+      round(pair_data$both_strike_rate * 100, 1), "%</p>",
+      "<p style='margin: 5px 0;'><b>Strike Rate Change:</b> ", 
+      ifelse(pair_data$strike_rate_diff >= 0, "+", ""),
+      round(pair_data$strike_rate_diff * 100, 1), " pp</p>",
+      "</div>"
+    ))
+  })
+  
+  output$hover_first_pitch_location <- renderPlot({
+    req(clicked_cell$first_pitch, input$pitcher)
+    
+    first_pitch <- clicked_cell$first_pitch
+    
+    # Get location data for first pitch
+    loc_data <- pitch_sequences %>%
+      filter(
+        Pitcher == input$pitcher,
+        prev_pitch_type == first_pitch
+      ) %>%
+      dplyr::select(prev_plate_loc_side, prev_plate_loc_height) %>%
+      filter(!is.na(prev_plate_loc_side), !is.na(prev_plate_loc_height))
+    
+    if(nrow(loc_data) < 5) {
+      return(
+        ggplot() +
+          annotate("text", x = 0, y = 2.5, label = "Insufficient data", 
+                   size = 5, color = "gray50") +
+          theme_void()
+      )
+    }
+    
+    # Rename columns for consistency with Heat Maps slide code
+    loc_data <- loc_data %>%
+      rename(PlateLocSide = prev_plate_loc_side,
+             PlateLocHeight = prev_plate_loc_height)
+    
+    tryCatch({
+      ggplot(loc_data, aes(x = PlateLocSide, y = PlateLocHeight)) +
+        stat_density_2d(aes(fill = ..density..), geom = 'raster', contour = FALSE) +
+        scale_fill_gradientn(colours = c("blue", "white", "red")) +
+        annotate("rect", xmin = -1, xmax = 1, ymin = 1.6, ymax = 3.4,
+                 fill = NA, color = "black", alpha = .1) +
+        geom_vline(xintercept = 0, linewidth = 0.3, color = "black", linetype = "dashed", alpha = 0.5) +
+        geom_hline(yintercept = 2.5, linewidth = 0.3, color = "black", linetype = "dashed", alpha = 0.5) +
+        ylim(1, 4) + xlim(-1.8, 1.8) +
+        theme_bw() +
+        theme_classic() +
+        xlab("") +
+        ylab("") +
+        ggtitle(paste0(first_pitch), 
+                subtitle = paste0("n = ", nrow(loc_data))) +
+        guides(fill = FALSE) +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray40", size = 9)
+        )
+    }, error = function(e) {
+      print(paste("Error in first pitch heatmap:", e$message))
+      ggplot() +
+        annotate("text", x = 0, y = 2.5, label = paste("Error:", e$message), 
+                 size = 4, color = "red") +
+        theme_void()
+    })
+  })
+  
+  output$hover_second_pitch_location <- renderPlot({
+    req(clicked_cell$first_pitch, clicked_cell$second_pitch, input$pitcher)
+    
+    first_pitch <- clicked_cell$first_pitch
+    second_pitch <- clicked_cell$second_pitch
+    
+    # Get location data for second pitch
+    loc_data <- pitch_sequences %>%
+      filter(
+        Pitcher == input$pitcher,
+        prev_pitch_type == first_pitch,
+        PitchType == second_pitch
+      ) %>%
+      dplyr::select(PlateLocSide, PlateLocHeight) %>%
+      filter(!is.na(PlateLocSide), !is.na(PlateLocHeight))
+    
+    if(nrow(loc_data) < 5) {
+      return(
+        ggplot() +
+          annotate("text", x = 0, y = 2.5, label = "Insufficient data", 
+                   size = 5, color = "gray50") +
+          theme_void()
+      )
+    }
+    
+    tryCatch({
+      ggplot(loc_data, aes(x = PlateLocSide, y = PlateLocHeight)) +
+        stat_density_2d(aes(fill = ..density..), geom = 'raster', contour = FALSE) +
+        scale_fill_gradientn(colours = c("blue", "white", "red")) +
+        annotate("rect", xmin = -1, xmax = 1, ymin = 1.6, ymax = 3.4,
+                 fill = NA, color = "black", alpha = .1) +
+        geom_vline(xintercept = 0, linewidth = 0.3, color = "black", linetype = "dashed", alpha = 0.5) +
+        geom_hline(yintercept = 2.5, linewidth = 0.3, color = "black", linetype = "dashed", alpha = 0.5) +
+        ylim(1, 4) + xlim(-1.8, 1.8) +
+        theme_bw() +
+        theme_classic() +
+        xlab("") +
+        ylab("") +
+        ggtitle(paste0(second_pitch), 
+                subtitle = paste0("n = ", nrow(loc_data))) +
+        guides(fill = FALSE) +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray40", size = 9)
+        )
+    }, error = function(e) {
+      print(paste("Error in second pitch heatmap:", e$message))
+      ggplot() +
+        annotate("text", x = 0, y = 2.5, label = paste("Error:", e$message), 
+                 size = 4, color = "red") +
+        theme_void()
+    })
+  })
+  
+  # ============================================================================
+  # END PITCH SEQUENCING TAB OUTPUTS
+  # ============================================================================
   
   output$pitch_location_plot1 <- renderPlot({
     data <- filtered_data()
