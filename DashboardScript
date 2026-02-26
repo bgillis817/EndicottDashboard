@@ -6,8 +6,8 @@ library(scales)
 library(tidyverse)
 library(readr)
 library(plotly)
-library(MASS)  # For kde2d in pitch sequencing heatmaps and movement consistency blobs
-library(purrr) # For map_dfr in KDE contour construction
+library(MASS)  
+library(purrr) 
 
 # Load and prepare data
 Endicott2026 <- read_csv("https://raw.githubusercontent.com/bgillis817/EndicottDashboard/refs/heads/main/ECRapsodo.csv")
@@ -57,8 +57,8 @@ Endicott2026 <- Endicott2026 %>%
     No = as.numeric(No),
     Date = as.Date(Date, format = "%m/%d/%Y"),
     arm_angle = ifelse(
-      !is.na(ReleaseHeight) & !is.na(ReleaseSide) & ReleaseSide != 0,
-      atan2(ReleaseHeight, abs(ReleaseSide)) * (180 / pi),
+      !is.na(ReleaseHeight) & !is.na(ReleaseSide) & !is.na(Height) & ReleaseSide != 0,
+      atan2(ReleaseHeight - (Height * 0.776), abs(ReleaseSide)) * (180 / pi),
       NA
     ),
     PlateLocSide = StrikeZoneSide / 12,
@@ -74,11 +74,9 @@ Endicott2026 <- Endicott2026 %>%
   mutate(OverallPitchCount = row_number()) %>%
   ungroup()
 
-# ============================================================================
-# PITCH SEQUENCING DATA PREPARATION
-# ============================================================================
 
-# Debug: Print column names to check for IsStrike
+# PITCH SEQUENCING
+
 print("Columns available for pitch sequencing:")
 print(names(Endicott2026))
 print(paste("IsStrike column exists:", "IsStrike" %in% names(Endicott2026)))
@@ -116,8 +114,6 @@ pitch_pair_matrix <- pitch_sequences %>%
 
 # Debug: Check if pitch_pair_matrix has data
 print(paste("Pitch pair matrix created:", nrow(pitch_pair_matrix), "rows"))
-
-# ============================================================================
 
 pitcher_names <- sort(unique(Endicott2026$Pitcher))
 
@@ -227,7 +223,6 @@ ui <- fluidPage(
                    )
                  )
         ),
-        # ===== END PITCH SEQUENCING TAB =====
         
         tabPanel("Locations", 
                  br(), 
@@ -326,14 +321,14 @@ server <- function(input, output, session) {
         
         tagList(
           hr(),
-          h5(paste0("Selected Sessions: ", nrow(session_summary), 
+          h5(paste0("Selected Outings: ", nrow(session_summary), 
                     " (", total_selected_pitches, " total pitches)")),
           tags$small(HTML(paste0(session_summary$date_label, ": ", 
                                  session_summary$pitches, " pitches", collapse = "<br>")))
         )
       }
     } else {
-      tagList(hr(), h5("No sessions selected"))
+      tagList(hr(), h5("No Outings Selected"))
     }
   })
   
@@ -359,7 +354,6 @@ server <- function(input, output, session) {
                       OverallPitchCount <= input$pitchRangeMax)
   })
   
-  # USING WORKING VERSION FROM DASHBOARDSCRIPT(2)
   output$pitcher_summary_table <- renderDataTable({
     data <- filtered_data()
     req(data)
@@ -376,12 +370,11 @@ server <- function(input, output, session) {
         HB = round(mean(HB_trajectory, na.rm = TRUE), 1),
         RelZ = round(mean(ReleaseHeight, na.rm = TRUE), 1),
         RelX = round(mean(ReleaseSide, na.rm = TRUE), 1),
-        Extension = round(mean(ReleaseExtension, na.rm = TRUE), 1),
         ArmAngle = round(mean(arm_angle, na.rm = TRUE), 1),
         .groups = 'drop'
       ) %>%
       mutate(Usage = scales::percent(Pitches / sum(Pitches), accuracy = 0.1)) %>%
-      dplyr::select(Pitch, Pitches, Usage, AvgVelo, MaxVelo, SpinRate, IVB, HB, RelZ, RelX, Extension, ArmAngle)
+      dplyr::select(Pitch, Pitches, Usage, AvgVelo, MaxVelo, SpinRate, IVB, HB, RelZ, RelX, ArmAngle)
     
     datatable(table, options = list(dom = 't'))
   })
@@ -403,7 +396,7 @@ server <- function(input, output, session) {
         )
       )
     
-    # Colour palette keyed to pitch types in this filtered set
+    # Colour palette keyed to pitch types
     pitch_types <- unique(data$PitchType)
     pal         <- scales::hue_pal()(length(pitch_types))
     names(pal)  <- pitch_types
@@ -413,7 +406,7 @@ server <- function(input, output, session) {
     prob_levels  <- seq(0.95, 0.10, length.out = n_shells)
     alpha_levels <- seq(0.04, 0.22, length.out = n_shells)
     
-    # Build KDE contour polygons per pitch type
+    # Build KDE contour shapes per pitch type
     kde_polys <- purrr::map_dfr(pitch_types, function(pt) {
       sub <- data %>%
         filter(PitchType == pt,
@@ -461,7 +454,7 @@ server <- function(input, output, session) {
       geom_hline(yintercept = 0, linewidth = 0.8, color = "gray60") +
       geom_vline(xintercept = 0, linewidth = 0.8, color = "gray60")
     
-    # Layer KDE shells faint -> dense — NO fill aes mapping so no fill legend
+    # Layer KDE shells faint -> dense
     if(!is.null(kde_polys) && nrow(kde_polys) > 0) {
       for(i in seq_len(n_shells)) {
         shell_data <- kde_polys %>% filter(shell == i)
@@ -492,7 +485,7 @@ server <- function(input, output, session) {
       labs(
         x        = "Horizontal Movement (HB)",
         y        = "Vertical Movement (IVB)",
-        title    = paste(input$pitcher, "- Movement Consistency (IVB vs HB)"),
+        title    = paste(input$pitcher, "- Movement Plot (IVB / HB)"),
         subtitle = "Shaded areas show how consistently the pitcher replicates pitch shape"
       ) +
       xlim(-30, 30) + ylim(-30, 30) +
@@ -564,33 +557,44 @@ server <- function(input, output, session) {
       )
   })
   
-  # ── Arm angle plot with SD fan shading + SD in hover ─────────────────────
   output$arm_angle_plot <- renderPlotly({
     data <- filtered_data()
     req(data)
     if(nrow(data) == 0) return(NULL)
     
-    arm_data <- data %>% filter(!is.na(arm_angle))
+    arm_data <- data %>% filter(!is.na(arm_angle), !is.na(Height))
     if(nrow(arm_data) == 0) return(NULL)
     
+    # Everything in normalized units — shoulder fixed at y = 0
+    arm_len <- 1.8
+    body_w  <- 0.20
+    body_h  <- 0.65
+    head_r  <- 0.18
+    head_cy <- 0.42   # head center above shoulder
+    
+    theta <- seq(0, 2 * pi, length.out = 100)
+    head_circle <- data.frame(
+      x = head_r * cos(theta),
+      y = head_cy + head_r * sin(theta)
+    )
+    
+    # One row per pitch type
     avg_angles <- arm_data %>%
       group_by(PitchType) %>%
       summarise(
-        avg_angle      = mean(arm_angle,      na.rm = TRUE),
-        sd_angle       = sd(arm_angle,        na.rm = TRUE),
-        avg_rel_side   = mean(ReleaseSide,    na.rm = TRUE),
-        avg_rel_height = mean(ReleaseHeight,  na.rm = TRUE),
-        n              = n(),
-        .groups        = 'drop'
+        avg_angle = mean(arm_angle,   na.rm = TRUE),
+        sd_angle  = sd(arm_angle,     na.rm = TRUE),
+        avg_side  = mean(ReleaseSide, na.rm = TRUE),
+        n         = n(),
+        .groups   = 'drop'
       ) %>%
       mutate(
-        # Fallback: single-pitch types get a minimal fan so no crash
-        sd_angle     = ifelse(is.na(sd_angle) | sd_angle == 0, 0.5, sd_angle),
-        xend         = avg_rel_side / 2,
-        yend         = 1 + avg_rel_height / 3,
-        base_angle   = atan2(yend - 1, xend - 0),
-        half_fan_rad = sd_angle * pi / 180,
-        hover_label  = paste0(
+        sd_angle    = ifelse(is.na(sd_angle) | sd_angle == 0, 0.5, sd_angle),
+        angle_rad   = avg_angle * pi / 180,
+        x_dir       = sign(avg_side),
+        xend        = x_dir * cos(angle_rad) * arm_len,
+        yend        = sin(angle_rad) * arm_len,
+        hover_label = paste0(
           "<b>", PitchType, "</b><br>",
           "Avg Arm Angle: ", round(avg_angle, 1), "\u00b0<br>",
           "SD: \u00b1",      round(sd_angle,  1), "\u00b0<br>",
@@ -598,65 +602,32 @@ server <- function(input, output, session) {
         )
       )
     
-    # Head circle
-    theta       <- seq(0, 2 * pi, length.out = 100)
-    head_circle <- data.frame(x = 0.25 * cos(theta), y = 1.7 + 0.25 * sin(theta))
-    
-    # Colour palette matching ggplot default
     pitch_types <- unique(avg_angles$PitchType)
     pal         <- scales::hue_pal()(length(pitch_types))
     names(pal)  <- pitch_types
     
-    # Base plot: body + head silhouette
     p <- ggplot() +
-      geom_rect(aes(xmin = -0.3, xmax = 0.3, ymin = 0, ymax = 1),
-                fill = "gray80", alpha = 0.3) +
+      geom_rect(aes(xmin = -body_w, xmax = body_w,
+                    ymin = -body_h,  ymax = 0),
+                fill = "gray80", color = NA, alpha = 0.5) +
       geom_polygon(data = head_circle, aes(x = x, y = y),
-                   fill = "gray80", alpha = 0.3)
-    
-    # Add SD fan per pitch type
-    n_pts <- 40
-    for(pt in pitch_types) {
-      row    <- avg_angles %>% filter(PitchType == pt)
-      col    <- pal[pt]
-      base_a <- row$base_angle
-      half_r <- row$half_fan_rad
-      
-      # Outer fan: full +/-1 SD, faint
-      angles_outer <- seq(base_a - half_r, base_a + half_r, length.out = n_pts)
-      fan_outer    <- data.frame(
-        x = c(0, 0.95 * cos(angles_outer), 0),
-        y = c(1, 1 + 0.95 * sin(angles_outer), 1)
-      )
-      
-      # Inner fan: +/-0.5 SD, darker (tight consistency zone)
-      half_r_inner <- half_r * 0.5
-      angles_inner <- seq(base_a - half_r_inner, base_a + half_r_inner, length.out = n_pts)
-      fan_inner    <- data.frame(
-        x = c(0, 0.95 * cos(angles_inner), 0),
-        y = c(1, 1 + 0.95 * sin(angles_inner), 1)
-      )
-      
-      p <- p +
-        geom_polygon(data = fan_outer, aes(x = x, y = y),
-                     fill = col, alpha = 0.15, color = NA) +
-        geom_polygon(data = fan_inner, aes(x = x, y = y),
-                     fill = col, alpha = 0.30, color = NA)
-    }
-    
-    # Arrows on top — hover carries avg angle + SD + n
-    p <- p +
+                   fill = "gray80", color = NA, alpha = 0.5) +
+      geom_point(aes(x = 0, y = 0), color = "gray40", size = 3) +
       geom_segment(
-        data = avg_angles,
-        aes(x = 0, y = 1, xend = xend, yend = yend,
+        data      = avg_angles,
+        aes(x = 0, y = 0, xend = xend, yend = yend,
             color = PitchType, text = hover_label),
-        linewidth = 2,
-        arrow = arrow(length = unit(0.3, "cm"))
+        linewidth = 2.2,
+        alpha     = 1,
+        arrow     = arrow(length = unit(0.3, "cm"))
       ) +
+      scale_color_manual(values = pal, name = "Pitch Type") +
       coord_fixed(ratio = 1) +
+      xlim(-2.2, 2.2) +
+      ylim(-body_h - 0.15, arm_len * 0.85) +
       labs(
         title    = paste(input$pitcher, "- Arm Angle by Pitch Type"),
-        subtitle = "Fan width reflects arm angle SD — narrower = more consistent slot"
+        subtitle = "One arrow per pitch type · Origin = shoulder · Hover for details"
       ) +
       theme_minimal() +
       theme(
@@ -666,8 +637,7 @@ server <- function(input, output, session) {
         axis.title      = element_blank(),
         panel.grid      = element_blank(),
         legend.position = "bottom"
-      ) +
-      xlim(-2, 2) + ylim(-0.5, 3)
+      )
     
     ggplotly(p, tooltip = "text") %>%
       layout(
@@ -1097,5 +1067,4 @@ server <- function(input, output, session) {
       guides(fill = FALSE)
   }, width = 700, height = 400)
 }
-
 shinyApp(ui = ui, server = server)
